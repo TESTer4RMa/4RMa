@@ -13,152 +13,83 @@ import concurrent.futures
 import logging
 import traceback
 import shutil
-import warnings # 加入這個來過濾警告
+import warnings
 
 # ==========================================
-# 0. 初始化日誌與設定 (Debug 增強版)
+# 0. 初始化與設定
 # ==========================================
-# 忽略 Flet 的 DeprecationWarning (Audio)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# 建立 Logger
+# 設定日誌
 logger = logging.getLogger()
-logger.setLevel(logging.INFO) # 改成 INFO，這樣連普通訊息都看得到
-
-# 格式設定
+logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-# 1. 輸出到檔案 (app.log)
 file_handler = logging.FileHandler('app.log', encoding='utf-8')
 file_handler.setFormatter(formatter)
-
-# 2. 同時輸出到螢幕 (Console)
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setFormatter(formatter)
-
-# 清除舊的 handler 避免重複，然後加入新的
-if logger.hasHandlers():
-    logger.handlers.clear()
+if logger.hasHandlers(): logger.handlers.clear()
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
-APP_TITLE = "阿嬤的讀信機 (全平台通用版)"
+APP_TITLE = "阿嬤的讀信機"
+
+# 1秒鐘的靜音 WAV (Base64)，用來騙過瀏覽器和 Flet 的初始化檢查，防止紅畫面
+SILENT_WAV_B64 = "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
 
 # ==========================================
-# 1. API Key 載入 (安全雙軌制)
+# 1. API Key 載入
 # ==========================================
 def load_key(env_name, filename):
-    """
-    載入 API Key 的策略：
-    1. 優先嘗試讀取「系統環境變數」(os.environ) -> 適合雲端部署，Key 不會外洩。
-    2. 如果沒有，再嘗試讀取「本地文字檔」(.txt) -> 適合本機測試，方便直接修改。
-    """
-    # 1. 嘗試環境變數 (雲端優先)
     env_key = os.environ.get(env_name)
-    if env_key:
-        logging.info(f"✅ 成功從環境變數載入: {env_name}")
-        return env_key.strip()
-
-    # 2. 嘗試本地檔案 (本機備用)
+    if env_key: return env_key.strip()
     try:
         if os.path.exists(filename):
-            with open(filename, "r", encoding="utf-8") as f: 
-                file_key = f.read().strip()
-                logging.info(f"📂 成功從檔案載入: {filename}")
-                return file_key
-    except Exception as e: 
-        logging.error(f"讀取 Key 檔案失敗: {e}")
-        
-    logging.warning(f"⚠️ 找不到 Key: {env_name} 或 {filename}")
+            with open(filename, "r", encoding="utf-8") as f: return f.read().strip()
+    except: pass
     return None
 
-# 修改這裡：同時指定「環境變數名稱」與「檔案名稱」
 GEMINI_API_KEY = load_key("GEMINI_API_KEY", "Gemini_API.txt")
 YATING_API_KEY = load_key("YATING_API_KEY", "Yating_API.txt")
 
 # ==========================================
-# 2. 大腦模組：Gemini (智慧自動偵測)
+# 2. 大腦模組：Gemini
 # ==========================================
 def ask_gemini_intent(image_bytes, is_detailed=False):
-    logging.info("正在呼叫 Gemini AI...")
+    logging.info("呼叫 Gemini...")
     if not GEMINI_API_KEY: raise ValueError("找不到 Gemini API Key")
-
-    # 設定 API Key
     genai.configure(api_key=GEMINI_API_KEY)
 
-    # ★★★ 關鍵修正：不再用猜的，直接問 Google 有哪些模型可用 ★★★
-    candidate_models = []
-    try:
-        logging.info("正在查詢您的 API Key 可用的模型清單...")
-        for m in genai.list_models():
-            # 只找支援 'generateContent' 的模型
-            if 'generateContent' in m.supported_generation_methods:
-                candidate_models.append(m.name)
-        
-        logging.info(f"Google 回傳可用模型: {candidate_models}")
-    except Exception as e:
-        logging.warning(f"無法列出模型 (將使用預設清單嘗試): {e}")
+    # 針對長輩優化的 Prompt
+    prompt = """
+    你是一位會講台語的貼心秘書。請看這張圖片，用「最簡單、最白話」的台語口語唸給阿嬤聽。
+    
+    **規則：**
+    1. **只講重點**：如果是藥袋，只講什麼藥、怎麼吃；如果是帳單，只講多少錢、截止日。
+    2. **語氣親切**：開頭可以加「阿嬤，這張是...」。
+    3. **全台語漢字**：請將內容轉寫為台語漢字（教育部推薦用字）。
+    4. **字數限制**：請控制在 80 字以內，阿嬤沒耐心聽太久。
+    """
+    if is_detailed:
+        prompt = "請將圖片內容「逐字」轉成台語口語唸出來，不要遺漏細節。"
 
-    # 如果自動偵測失敗，才使用備用清單
-    if not candidate_models:
-        candidate_models = [
-            'models/gemini-1.5-flash',
-            'models/gemini-1.5-flash-latest',
-            'models/gemini-pro',
-            'models/gemini-pro-vision',
-            'models/gemini-1.0-pro'
-        ]
-
-    # ★ 排序策略：優先使用 flash (速度快/便宜) > pro (穩定) > exp (實驗版易失敗)
-    def model_priority(name):
-        name = name.lower()
-        if 'flash' in name and 'exp' not in name: return 0  # 最優先：穩定版 flash
-        if 'pro' in name and 'exp' not in name: return 1    # 次優先：穩定版 pro
-        if 'flash' in name: return 2                        # 再次：實驗版 flash
-        return 3                                            # 最後：其他
-
-    # 重新排序候選名單
-    candidate_models.sort(key=model_priority)
-    logging.info(f"嘗試順序: {candidate_models}")
-
+    # 自動偵測模型
+    candidate_models = ['models/gemini-1.5-flash', 'models/gemini-pro', 'models/gemini-1.5-flash-latest']
+    
     last_error = None
-    response = None
-
     for model_name in candidate_models:
         try:
-            logging.info(f"正在嘗試模型: {model_name}")
             model = genai.GenerativeModel(model_name)
-            
-            if is_detailed:
-                prompt = "你現在是一個「台語讀稿機」。請將圖片上的文字，**逐字逐句**轉換成台語口語唸出來。要求：忠實還原、直讀、台語化。只輸出台語漢字。"
-            else:
-                prompt = "你是一位貼心的秘書。請看這張圖片，幫阿嬤判斷「核心重點」是什麼。要求：只講結論(藥單唸藥名吃法、帳單唸金額)、100字內。只輸出台語漢字。"
-            
-            logging.info(f"發送圖片大小: {len(image_bytes)} bytes")
-            # 嘗試生成內容
             response = model.generate_content([prompt, {'mime_type': 'image/jpeg', 'data': image_bytes}])
-            
-            # 如果成功執行到這裡，代表模型可用，跳出迴圈
-            logging.info(f"✅ 模型 {model_name} 執行成功！")
-            break 
-
+            if response.text: return response.text
         except Exception as e:
-            # 印出錯誤並繼續下一個
-            logging.warning(f"❌ 模型 {model_name} 失敗: {e}")
             last_error = e
             continue
-    
-    # 檢查有沒有任何一個成功
-    if response and response.text:
-        logging.info(f"Gemini 回應: {response.text[:50]}...") 
-        return response.text
-    else:
-        # 如果全部都失敗，拋出最後一個錯誤
-        logging.error("😱 所有模型嘗試皆失敗，請檢查 API Key 是否有權限或額度")
-        raise RuntimeError(f"AI 識別失敗 (已嘗試所有可用模型): {str(last_error)}")
+            
+    raise RuntimeError(f"AI 讀取失敗，請重試: {str(last_error)}")
 
 # ==========================================
-# 3. 嘴巴模組：雅婷 TTS (強化版)
+# 3. 嘴巴模組：雅婷 TTS
 # ==========================================
 def split_text_smartly(text, limit=280):
     sentences = re.split(r'(。|，|\n|；|！|？)', text)
@@ -177,13 +108,8 @@ def download_chunk_safe(params):
     text_chunk, index = params
     if not YATING_API_KEY: raise ValueError("缺少 Yating API Key")
     
-    # ★★★ 關鍵修正：增加重試機制 (Retry) ★★★
-    max_retries = 3
-    timeout_sec = 30 # 延長 timeout 到 30 秒
-
-    for attempt in range(max_retries):
+    for attempt in range(3): # 重試 3 次
         try:
-            logging.info(f"正在下載語音片段 {index} (嘗試 {attempt + 1}/{max_retries})...")
             response = requests.post(
                 "https://tts.api.yating.tw/v2/speeches/short",
                 headers={"Content-Type": "application/json", "key": YATING_API_KEY},
@@ -192,22 +118,17 @@ def download_chunk_safe(params):
                     "voice": {"model": "tai_female_1", "speed": 1.0, "pitch": 1.0, "energy": 1.0},
                     "audioConfig": {"encoding": "LINEAR16", "sampleRate": "16K"}
                 },
-                timeout=timeout_sec
+                timeout=30
             )
-            response.raise_for_status()
-            data = response.json()
-            if data.get("audioContent"):
-                temp_name = f"temp_part_{index}.wav"
-                with open(temp_name, "wb") as f: 
-                    f.write(base64.b64decode(data.get("audioContent")))
-                return (index, temp_name)
-        except Exception as e:
-            logging.warning(f"Chunk {index} 下載失敗 (嘗試 {attempt + 1}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2) # 休息 2 秒再試
-            else:
-                logging.error(f"Chunk {index} 最終失敗")
-                raise e # 試了 3 次都失敗，往上拋出錯誤
+            if response.status_code in [200, 201]:
+                data = response.json()
+                if data.get("audioContent"):
+                    temp_name = f"temp_part_{index}.wav"
+                    with open(temp_name, "wb") as f: 
+                        f.write(base64.b64decode(data.get("audioContent")))
+                    return (index, temp_name)
+            time.sleep(1)
+        except: time.sleep(1)
     return None
 
 def generate_merged_audio(text):
@@ -216,24 +137,20 @@ def generate_merged_audio(text):
     created_files = []
     
     try:
-        # ★★★ 關鍵修正：降低平行下載數 (3 -> 2)，避免網路塞車導致 Timeout ★★★
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             tasks = [(chunk, i) for i, chunk in enumerate(chunks)]
             futures = {executor.submit(download_chunk_safe, task): task[1] for task in tasks}
             for future in concurrent.futures.as_completed(futures):
-                try:
-                    idx, fname = future.result()
+                res = future.result()
+                if res:
+                    idx, fname = res
                     temp_files_map[idx] = fname
                     created_files.append(fname)
-                except Exception as e: raise e
 
-        if len(temp_files_map) != len(chunks): raise RuntimeError("下載片段不全")
+        if len(temp_files_map) != len(chunks): raise RuntimeError("語音合成不完整")
         
-        # ★★★ 修改這裡：把檔案存到 assets 資料夾底下 (解決手機播放問題) ★★★
-        filename = f"full_audio_{int(time.time())}.wav"
-        # 確保路徑是 assets/filename.wav
+        filename = f"audio_{int(time.time())}.wav"
         output_filepath = os.path.join("assets", filename)
-        
         sorted_files = [temp_files_map[i] for i in range(len(chunks))]
         
         with wave.open(output_filepath, 'wb') as wav_out:
@@ -243,233 +160,255 @@ def generate_merged_audio(text):
                     wav_out.writeframes(wav_in.readframes(wav_in.getnframes()))
                 try: os.remove(temp_file)
                 except: pass
-        
-        logging.info(f"語音合併完成: {output_filepath}")
-        return filename # ★★★ 注意：Flet 只需要檔名，它會自動去 assets 資料夾找
+        return filename
     except Exception as e:
         for f in created_files:
             if os.path.exists(f): os.remove(f)
         raise e
 
 # ==========================================
-# 4. App 主介面 (支援上傳模式)
+# 4. App 主介面 (阿嬤友善版)
 # ==========================================
 def main(page: ft.Page):
+    # 基礎設定
     page.title = APP_TITLE
-    page.window_width = 480
-    page.window_height = 850
-    page.bgcolor = "#FFF8F0"
+    page.bgcolor = "#FFF8E1" # 溫暖的米黃色背景
     page.theme_mode = ft.ThemeMode.LIGHT
+    page.padding = 20
     page.upload_dir = "uploads"
-    # 確保資料夾存在
-    os.makedirs(page.upload_dir, exist_ok=True)
-    os.makedirs("assets", exist_ok=True) # 確保 assets 也存在
-
-    is_seeking = False 
-    current_mode = {"is_detailed": False}
-    # 緩存音訊長度，避免重複查詢造成 Timeout
-    current_duration = 0 
-
-    img_display = ft.Image(src="", width=300, height=300, fit=ft.ImageFit.CONTAIN, visible=False)
-    result_text = ft.Text(value="請選一張相片...", size=20, color="#333", weight="bold")
-    status_text = ft.Text(value="準備就緒", size=14, color="grey")
-    
-    slider_progress = ft.Slider(min=0, max=1000, value=0, expand=True, disabled=True)
-    txt_duration = ft.Text("00:00 / 00:00", size=12, color="grey")
-    btn_play = ft.IconButton(icon="play_circle", icon_size=60, icon_color="blue", disabled=True)
-    
-    panel_player = ft.Column([
-        ft.Row([slider_progress]),
-        ft.Row([txt_duration, ft.Container(expand=True)]),
-        ft.Row([btn_play], alignment=ft.MainAxisAlignment.CENTER)
-    ], visible=False)
-
-    scroll_container = ft.Column([result_text, status_text], scroll=ft.ScrollMode.AUTO, height=150)
-    audio_player = ft.Audio(src="", autoplay=False)
-    page.overlay.append(audio_player)
-
-    def show_error(msg):
-        logging.error(f"UI顯示錯誤: {msg}")
-        status_text.value = f"❌ {msg}"
-        status_text.color = "red"
-        page.update()
-
-    def cleanup():
-        # 清理舊的音檔，包括 assets 裡面的
-        try:
-            for f in glob.glob("assets/full_audio_*.wav") + glob.glob("full_audio_*.wav") + glob.glob("temp_part_*.wav"):
-                try: os.remove(f)
-                except: pass
-        except: pass
-
-    def run_process_in_thread(image_bytes, is_detailed):
-        logging.info("執行緒啟動: 開始處理圖片")
-        try:
-            if not GEMINI_API_KEY or not YATING_API_KEY: raise ValueError("缺少 API Key")
-            
-            taigi_reply = ask_gemini_intent(image_bytes, is_detailed)
-            result_text.value = taigi_reply
-            status_text.value = "AI 思考完畢，正在合成語音..."
-            status_text.color = "#1976D2"
-            page.update()
-
-            final_wav_filename = generate_merged_audio(taigi_reply)
-            
-            status_text.value = "準備播放..."
-            status_text.color = "green"
-            audio_player.src = final_wav_filename
-            audio_player.update()
-            
-            # 重置播放狀態
-            nonlocal current_duration
-            current_duration = 0
-            
-            panel_player.visible = True
-            btn_play.disabled = False
-            btn_play.icon = "pause_circle"
-            slider_progress.disabled = False
-            page.update()
-            
-            time.sleep(0.5)
-            logging.info("嘗試播放音效")
-            audio_player.play()
-        except Exception as e:
-            logging.error(traceback.format_exc())
-            show_error(str(e))
-            panel_player.visible = False
-            page.update()
-
-    def on_upload_result(e: ft.FilePickerUploadEvent):
-        logging.info(f"上傳事件觸發: progress={e.progress}, file={e.file_name}")
-        if e.progress == 1.0:
-            status_text.value = "上傳完成，AI 讀取中..."
-            page.update()
-            file_name = e.file_name
-            file_path = os.path.join(page.upload_dir, file_name)
-            try:
-                logging.info(f"讀取上傳檔案: {file_path}")
-                with open(file_path, "rb") as f: image_bytes = f.read()
-                img_display.visible = False 
-                threading.Thread(target=run_process_in_thread, args=(image_bytes, current_mode["is_detailed"]), daemon=True).start()
-            except Exception as err: 
-                logging.error(traceback.format_exc())
-                show_error(f"讀取檔案失敗: {err}")
-
-    def on_file_picked(e: ft.FilePickerResultEvent):
-        if e.files:
-            file_obj = e.files[0]
-            cleanup()
-            status_text.value = "正在上傳圖片..."
-            status_text.color = "grey"
-            panel_player.visible = False
-            page.update()
-            logging.info(f"使用者選擇了檔案: {file_obj.name}, 開始上傳...")
-            upload_url = page.get_upload_url(file_obj.name, 600)
-            file_picker.upload([ft.FilePickerUploadFile(file_obj.name, upload_url)])
-        else:
-            logging.info("使用者取消了檔案選擇")
-
-    file_picker = ft.FilePicker(on_result=on_file_picked, on_upload=on_upload_result)
-    page.overlay.append(file_picker)
-
-    def play_pause_click(e):
-        if btn_play.icon == "pause_circle":
-            audio_player.pause()
-            btn_play.icon = "play_circle"
-        else:
-            if btn_play.icon == "replay_circle": audio_player.seek(0)
-            audio_player.resume()
-            btn_play.icon = "pause_circle"
-        page.update()
-
-    def slider_event(e):
-        nonlocal is_seeking
-        if e.event_type == "change_start": is_seeking = True
-        elif e.event_type == "change_end":
-            audio_player.seek(int(slider_progress.value))
-            is_seeking = False
-
-    def on_position_changed(e):
-        nonlocal current_duration
-        if not is_seeking:
-            # ★ 關鍵優化：緩存 Duration，避免頻繁查詢導致無聲電腦 Timeout
-            if current_duration == 0:
-                try:
-                    # 只有還不知道長度時才去問
-                    d = audio_player.get_duration()
-                    if d: current_duration = d
-                except: pass # 如果問不到(無聲電腦)，就裝作沒事，不要報錯
-
-            pos = float(e.data)
-            dur = current_duration
-            
-            if dur > 0:
-                slider_progress.max = dur
-                slider_progress.value = min(pos, dur)
-                txt_duration.value = f"{int(pos//1000)//60:02}:{int(pos//1000)%60:02} / {int(dur//1000)//60:02}:{int(dur//1000)%60:02}"
-                page.update()
-
-    def on_player_state_changed(e):
-        if e.data == "completed":
-            btn_play.icon = "replay_circle"
-            btn_play.icon_color = "green"
-            status_text.value = "播放完畢"
-            page.update()
-
-    audio_player.on_position_changed = on_position_changed
-    audio_player.on_state_changed = on_player_state_changed
-    btn_play.on_click = play_pause_click
-    slider_progress.on_change_start = slider_event
-    slider_progress.on_change_end = slider_event
-
-    def mode_click(is_detailed):
-        current_mode["is_detailed"] = is_detailed
-        file_picker.pick_files(allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE)
-
-    page.add(
-        ft.Container(height=10),
-        ft.Text(APP_TITLE, size=24, weight="bold", color="#1976D2", text_align=ft.TextAlign.CENTER),
-        ft.Divider(),
-        ft.Container(content=img_display, alignment=ft.alignment.center, height=250),
-        ft.Container(content=panel_player, bgcolor="#F0F0F0", padding=10, border_radius=10),
-        ft.Container(height=10),
-        ft.Row([
-            ft.ElevatedButton(" 簡略模式 ", icon="short_text", on_click=lambda e: mode_click(False), expand=True),
-            ft.ElevatedButton(" 照片模式 ", icon="description", on_click=lambda e: mode_click(True), expand=True),
-        ], spacing=20),
-        ft.Divider(),
-        scroll_container
-    )
-    if not GEMINI_API_KEY or not YATING_API_KEY: show_error("啟動失敗：找不到 API Key")
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 0))
-    print("Application started.")
-    
-    # 建立必要的資料夾 (uploads 和 assets)
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("assets", exist_ok=True)
 
-    os.environ["FLET_SECRET_KEY"] = "GrandmaSecretKey2025"
+    # 解決紅畫面關鍵：初始化給它一個 Base64 的靜音檔
+    audio_player = ft.Audio(src_base64=SILENT_WAV_B64, autoplay=False)
+    page.overlay.append(audio_player)
+
+    # --- UI 狀態控制變數 ---
+    current_mode = {"is_detailed": False}
     
-    # ★★★ 智慧啟動邏輯 (保留您測試成功的設定) ★★★
+    # --- 元件定義 ---
+    
+    # 1. 頂部標題
+    header = ft.Container(
+        content=ft.Column([
+            ft.Text("👵 阿嬤的讀信機", size=32, weight="bold", color="#5D4037"),
+            ft.Text("拍藥單、讀信、唸簡訊", size=18, color="#8D6E63"),
+        ], spacing=5, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        alignment=ft.alignment.center,
+        margin=ft.margin.only(bottom=20)
+    )
+
+    # 2. 中央大圖示 (狀態顯示區)
+    # 改用字串名稱，避免 AttributeError
+    status_icon = ft.Icon(name="camera_alt_rounded", size=120, color="#FF9800")
+    status_spinner = ft.ProgressRing(width=80, height=80, stroke_width=8, color="#2196F3", visible=False)
+    
+    # 狀態文字 (超大字體)
+    status_label = ft.Text("按下面按鈕\n開始拍照", size=28, weight="bold", color="#4E342E", text_align=ft.TextAlign.CENTER)
+    
+    # 顯示辨識結果的區域 (預設隱藏)
+    result_card = ft.Container(
+        content=ft.Column([
+            ft.Text("阿嬤，這張寫的是：", size=20, color="blue"),
+            ft.Text("", size=24, weight="bold", color="black", ref=None), # 這裡會填入結果
+        ]),
+        bgcolor="white",
+        padding=20,
+        border_radius=15,
+        visible=False,
+        border=ft.border.all(2, "#E0E0E0")
+    )
+    result_text_ref = result_card.content.controls[1] # 取得文字元件的引用
+
+    # 中央顯示區塊
+    center_display = ft.Container(
+        content=ft.Column([
+            ft.Container(height=20),
+            ft.Stack([
+                ft.Container(content=status_icon, alignment=ft.alignment.center),
+                ft.Container(content=status_spinner, alignment=ft.alignment.center),
+            ], height=150),
+            ft.Container(height=20),
+            status_label,
+            ft.Container(height=20),
+            result_card
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        alignment=ft.alignment.center,
+        expand=True
+    )
+
+    # 3. 底部大按鈕 (操作區)
+    # 用 Container 做按鈕，因為可以做得更大更漂亮
+    def make_big_button(icon_name, text, color, on_click):
+        return ft.Container(
+            content=ft.Row([
+                ft.Icon(icon_name, size=40, color="white"),
+                ft.Text(text, size=28, weight="bold", color="white"),
+            ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
+            bgcolor=color,
+            padding=20,
+            border_radius=50, # 圓角
+            # 使用透明黑色的 Hex 代碼 #4D000000 (約30%透明度) 取代 ft.colors.with_opacity
+            shadow=ft.BoxShadow(spread_radius=1, blur_radius=10, color="#4D000000", offset=ft.Offset(0, 5)),
+            on_click=on_click,
+            ink=True, # 點擊波紋效果
+        )
+
+    # 改用字串名稱
+    btn_camera = make_big_button("camera_alt", " 影 相 片 ", "#FF9800", lambda e: call_upload())
+    
+    # 播放按鈕 (預設隱藏)
+    btn_play = ft.Container(
+        content=ft.Row([
+            # 改用字串名稱
+            ft.Icon("play_circle_fill", size=50, color="white"),
+            ft.Text(" 再聽一次 ", size=28, weight="bold", color="white"),
+        ], alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#4CAF50",
+        padding=20,
+        border_radius=50,
+        # 使用透明黑色的 Hex 代碼 #4D000000 取代 ft.colors.with_opacity
+        shadow=ft.BoxShadow(spread_radius=1, blur_radius=10, color="#4D000000", offset=ft.Offset(0, 5)),
+        on_click=lambda e: audio_player.play(),
+        visible=False,
+        ink=True
+    )
+
+    # 底部容器
+    footer = ft.Container(
+        content=ft.Column([
+            btn_play,
+            ft.Container(height=10),
+            btn_camera
+        ]),
+        padding=ft.margin.only(bottom=30)
+    )
+
+    # --- 邏輯處理區 ---
+
+    def update_status(mode):
+        """切換介面狀態 (Idle, Loading, Playing, Error)"""
+        # 使用字串名稱設定 Icon，避免 Attribute Error
+        if mode == "idle":
+            status_icon.name = "camera_alt_rounded"
+            status_icon.color = "#FF9800" # 橘色
+            status_icon.visible = True
+            status_spinner.visible = False
+            status_label.value = "按下面按鈕\n開始拍照"
+            btn_camera.disabled = False
+            btn_play.visible = False
+            
+        elif mode == "uploading":
+            status_icon.visible = False
+            status_spinner.visible = True
+            status_label.value = "相片上傳中..."
+            btn_camera.disabled = True
+            
+        elif mode == "thinking":
+            status_icon.name = "psychology"
+            status_icon.color = "#2196F3" # 藍色
+            status_icon.visible = True
+            status_spinner.visible = True # 繼續轉
+            status_label.value = "阿嬤修等幾勒\n我咧看信..." # 台語親切感
+            
+        elif mode == "speaking":
+            status_icon.name = "record_voice_over"
+            status_icon.color = "#4CAF50" # 綠色
+            status_icon.visible = True
+            status_spinner.visible = False
+            status_label.value = "讀完囉！\n沒聽到請按綠色按鈕"
+            btn_camera.disabled = False
+            btn_play.visible = True
+            
+        elif mode == "error":
+            status_icon.name = "error_outline"
+            status_icon.color = "red"
+            status_icon.visible = True
+            status_spinner.visible = False
+            # 錯誤訊息會在外面設定
+            btn_camera.disabled = False
+
+        page.update()
+
+    def run_ai_task(image_bytes):
+        try:
+            update_status("thinking")
+            
+            # 1. 辨識
+            text = ask_gemini_intent(image_bytes, current_mode["is_detailed"])
+            result_text_ref.value = text
+            result_card.visible = True
+            page.update()
+            
+            # 2. 合成
+            wav_file = generate_merged_audio(text)
+            
+            # 3. 準備播放
+            update_status("speaking")
+            audio_player.src = wav_file
+            audio_player.update()
+            
+            # 嘗試自動播放 (手機可能會擋，所以我們有顯示綠色大按鈕)
+            time.sleep(0.5)
+            audio_player.play()
+            
+        except Exception as e:
+            update_status("error")
+            status_label.value = "拍謝，剛才沒看清楚\n請再拍一次"
+            logging.error(f"Error: {e}")
+            page.update()
+
+    def on_upload_result(e: ft.FilePickerUploadEvent):
+        if e.progress == 1.0:
+            file_path = os.path.join(page.upload_dir, e.file_name)
+            try:
+                with open(file_path, "rb") as f: image_bytes = f.read()
+                # 啟動後台執行緒
+                threading.Thread(target=run_ai_task, args=(image_bytes,), daemon=True).start()
+            except Exception as err:
+                update_status("error")
+                status_label.value = "讀取檔案失敗"
+                page.update()
+
+    def call_upload():
+        # 呼叫上傳前，先清空舊狀態
+        result_card.visible = False
+        btn_play.visible = False
+        file_picker.pick_files(allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE)
+
+    def on_file_picked(e: ft.FilePickerResultEvent):
+        if e.files:
+            update_status("uploading")
+            file_obj = e.files[0]
+            upload_url = page.get_upload_url(file_obj.name, 600)
+            file_picker.upload([ft.FilePickerUploadFile(file_obj.name, upload_url)])
+        else:
+            # 使用者取消，回到原狀
+            update_status("idle")
+
+    # 初始化 FilePicker
+    file_picker = ft.FilePicker(on_result=on_file_picked, on_upload=on_upload_result)
+    page.overlay.append(file_picker)
+
+    # 組合畫面
+    page.add(
+        ft.Column([
+            header,
+            center_display,
+            footer
+        ], expand=True, alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+    )
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 0))
+    # 建立目錄
+    os.makedirs("uploads", exist_ok=True)
+    os.makedirs("assets", exist_ok=True)
+    # 設定密鑰
+    os.environ["FLET_SECRET_KEY"] = "GrandmaSecret2025"
+    
     try:
-        print("🚀 嘗試以 [公開模式] 啟動 (手機可連線)...")
-        ft.app(
-            target=main, 
-            view=ft.AppView.WEB_BROWSER, 
-            port=port,
-            host="0.0.0.0", 
-            upload_dir="uploads",
-            assets_dir="assets" # 確保 Flet 知道去哪裡找音檔
-        )
-    except Exception as e:
-        print(f"⚠️ 公開模式啟動失敗: {e}")
-        print("🔄 自動切換為 [本機模式]...")
-        ft.app(
-            target=main, 
-            view=ft.AppView.WEB_BROWSER, 
-            port=port,
-            upload_dir="uploads",
-            assets_dir="assets"
-        )
+        print("🚀 啟動中...")
+        ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0", upload_dir="uploads", assets_dir="assets")
+    except:
+        ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, upload_dir="uploads", assets_dir="assets")
