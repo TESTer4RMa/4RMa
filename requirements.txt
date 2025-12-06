@@ -1,0 +1,3 @@
+flet
+google-generativeai
+requests
