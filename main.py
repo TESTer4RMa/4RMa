@@ -211,36 +211,24 @@ def download_chunk_safe(params):
     return None
 
 def generate_merged_audio(text):
-    chunks = split_text_smartly(text)
-    temp_files_map = {}
-    created_files = []
-    
-    try:
-        # ★★★ 關鍵修正：降低平行下載數 (3 -> 2)，避免網路塞車導致 Timeout ★★★
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            tasks = [(chunk, i) for i, chunk in enumerate(chunks)]
-            futures = {executor.submit(download_chunk_safe, task): task[1] for task in tasks}
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    idx, fname = future.result()
-                    temp_files_map[idx] = fname
-                    created_files.append(fname)
-                except Exception as e: raise e
-
+    # ... (前面省略) ...
         if len(temp_files_map) != len(chunks): raise RuntimeError("下載片段不全")
         
-        output_filename = f"full_audio_{int(time.time())}.wav"
+        # ★★★ 修改這裡：把檔案存到 assets 資料夾底下 ★★★
+        # 使用 os.path.join 確保路徑正確
+        filename = f"full_audio_{int(time.time())}.wav"
+        output_filepath = os.path.join("assets", filename) 
+        
         sorted_files = [temp_files_map[i] for i in range(len(chunks))]
         
-        with wave.open(output_filename, 'wb') as wav_out:
+        with wave.open(output_filepath, 'wb') as wav_out: # 寫入到 assets/xxx.wav
             for i, temp_file in enumerate(sorted_files):
-                with wave.open(temp_file, 'rb') as wav_in:
-                    if i == 0: wav_out.setparams(wav_in.getparams())
-                    wav_out.writeframes(wav_in.readframes(wav_in.getnframes()))
+# ... (中間寫入邏輯不變) ...
                 try: os.remove(temp_file)
                 except: pass
-        logging.info(f"語音合併完成: {output_filename}")
-        return output_filename
+        
+        logging.info(f"語音合併完成: {output_filepath}")
+        return filename # ★★★ 注意：回傳只要檔名就好，不用 assets/ 前綴
     except Exception as e:
         for f in created_files:
             if os.path.exists(f): os.remove(f)
@@ -445,6 +433,7 @@ if __name__ == "__main__":
             target=main, 
             view=ft.AppView.WEB_BROWSER, 
             port=port,
+            host="0.0.0.0", 
             upload_dir="uploads"
         )
     except Exception as e:
