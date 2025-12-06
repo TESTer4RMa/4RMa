@@ -53,36 +53,64 @@ GEMINI_API_KEY = load_key("GEMINI_API_KEY", "Gemini_API.txt")
 YATING_API_KEY = load_key("YATING_API_KEY", "Yating_API.txt")
 
 # ==========================================
-# 2. 大腦模組：Gemini
+# 2. 大腦模組：Gemini (Prompt 深度優化版)
 # ==========================================
 def ask_gemini_intent(image_bytes, is_detailed=False):
     logging.info("呼叫 Gemini...")
     if not GEMINI_API_KEY: raise ValueError("找不到 Gemini API Key")
     genai.configure(api_key=GEMINI_API_KEY)
 
-    # 針對長輩優化的 Prompt
-    prompt = """
-    你是一位會講台語的貼心秘書。請看這張圖片，用「最簡單、最白話」的台語口語唸給阿嬤聽。
-    
-    **規則：**
-    1. **只講重點**：如果是藥袋，只講什麼藥、怎麼吃；如果是帳單，只講多少錢、截止日。
-    2. **語氣親切**：開頭可以加「阿嬤，這張是...」。
-    3. **全台語漢字**：請將內容轉寫為台語漢字（教育部推薦用字）。
-    4. **字數限制**：請控制在 80 字以內，阿嬤沒耐心聽太久。
-    """
+    # ★★★ 修正：完全依照您的「收據/藥單」場景設定 Prompt ★★★
     if is_detailed:
-        prompt = "請將圖片內容「逐字」轉成台語口語唸出來，不要遺漏細節。"
+        # 照片模式：無情的讀稿機 (全念)
+        prompt = """
+        你現在是一個「盲人閱讀輔助器」。請將圖片中的**所有文字**，依照由上到下、由左至右的順序，轉換成台語漢字唸出來。
+        
+        **嚴格執行規則：**
+        1. **完整性優先**：請唸出所有細節，包含醫院名稱、地址、電話、掛號費明細、備註欄。不要遺漏任何角落的字。
+        2. **禁止摘要**：不准說「這是收據」、「總共多少錢」，請直接唸上面的字。
+        3. **格式**：請用逗號或句號適當斷句，方便語音合成。
+        """
+    else:
+        # 簡略模式：精明的小助手 (抓重點)
+        prompt = """
+        你是一位精明的管家。請看完這張圖片，判斷它是什麼單據，並用「最簡短的台語口語」告訴阿嬤重點。
+        
+        **判斷邏輯：**
+        1. **若是收據/發票**：只唸「總金額」與「繳費期限」(若有)。(例：阿嬤，這張是收據，總共愛繳 320 元)
+        2. **若是藥單**：只唸「藥名」與「吃法」(早晚/飯後)。(例：阿嬤，這是血壓藥，早晚飯後食)
+        3. **若是信件**：只唸「誰寄的」與「要做什麼」。
+        4. **若是唐詩/文章**：用白話文解釋大意。
+        
+        **限制**：請控制在 30 字以內，不要廢話。
+        """
 
     # 自動偵測模型
-    candidate_models = ['models/gemini-1.5-flash', 'models/gemini-pro', 'models/gemini-1.5-flash-latest']
+    candidate_models = []
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                candidate_models.append(m.name)
+    except Exception as e:
+        logging.warning(f"自動偵測模型失敗: {e}")
+
+    if not candidate_models:
+        candidate_models = ['models/gemini-1.5-flash', 'models/gemini-pro']
+
+    def model_priority(name):
+        if 'flash' in name.lower(): return 0
+        return 1
+    candidate_models.sort(key=model_priority)
     
     last_error = None
     for model_name in candidate_models:
         try:
+            logging.info(f"嘗試模型: {model_name}")
             model = genai.GenerativeModel(model_name)
             response = model.generate_content([prompt, {'mime_type': 'image/jpeg', 'data': image_bytes}])
             if response.text: return response.text
         except Exception as e:
+            logging.warning(f"模型 {model_name} 失敗: {e}")
             last_error = e
             continue
             
@@ -167,26 +195,21 @@ def generate_merged_audio(text):
         raise e
 
 # ==========================================
-# 4. App 主介面 (阿嬤友善版)
+# 4. App 主介面 (UI 配色調整版)
 # ==========================================
 def main(page: ft.Page):
-    # 基礎設定
     page.title = APP_TITLE
-    page.bgcolor = "#FFF8E1" # 溫暖的米黃色背景
+    page.bgcolor = "#FFF8E1" 
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 20
     page.upload_dir = "uploads"
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("assets", exist_ok=True)
 
-    # 解決紅畫面關鍵：初始化給它一個 Base64 的靜音檔
     audio_player = ft.Audio(src_base64=SILENT_WAV_B64, autoplay=False)
     page.overlay.append(audio_player)
 
-    # --- UI 狀態控制變數 ---
     current_mode = {"is_detailed": False}
-    
-    # --- 元件定義 ---
     
     # 1. 頂部標題
     header = ft.Container(
@@ -198,19 +221,16 @@ def main(page: ft.Page):
         margin=ft.margin.only(bottom=20)
     )
 
-    # 2. 中央大圖示 (狀態顯示區)
-    # 改用字串名稱，避免 AttributeError
+    # 2. 中央大圖示
     status_icon = ft.Icon(name="camera_alt_rounded", size=120, color="#FF9800")
     status_spinner = ft.ProgressRing(width=80, height=80, stroke_width=8, color="#2196F3", visible=False)
+    status_label = ft.Text("請選擇模式\n開始拍照", size=28, weight="bold", color="#4E342E", text_align=ft.TextAlign.CENTER)
     
-    # 狀態文字 (超大字體)
-    status_label = ft.Text("按下面按鈕\n開始拍照", size=28, weight="bold", color="#4E342E", text_align=ft.TextAlign.CENTER)
-    
-    # 顯示辨識結果的區域 (預設隱藏)
+    # 辨識結果區
     result_card = ft.Container(
         content=ft.Column([
             ft.Text("阿嬤，這張寫的是：", size=20, color="blue"),
-            ft.Text("", size=24, weight="bold", color="black", ref=None), # 這裡會填入結果
+            ft.Text("", size=24, weight="bold", color="black", ref=None), 
         ]),
         bgcolor="white",
         padding=20,
@@ -218,9 +238,8 @@ def main(page: ft.Page):
         visible=False,
         border=ft.border.all(2, "#E0E0E0")
     )
-    result_text_ref = result_card.content.controls[1] # 取得文字元件的引用
+    result_text_ref = result_card.content.controls[1]
 
-    # 中央顯示區塊
     center_display = ft.Container(
         content=ft.Column([
             ft.Container(height=20),
@@ -237,121 +256,103 @@ def main(page: ft.Page):
         expand=True
     )
 
-    # 3. 底部大按鈕 (操作區)
-    # 用 Container 做按鈕，因為可以做得更大更漂亮
+    # 3. 按鈕與操作區
     def make_big_button(icon_name, text, color, on_click):
         return ft.Container(
             content=ft.Row([
-                ft.Icon(icon_name, size=40, color="white"),
-                ft.Text(text, size=28, weight="bold", color="white"),
-            ], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
+                ft.Icon(icon_name, size=32, color="white"),
+                ft.Text(text, size=22, weight="bold", color="white"),
+            ], alignment=ft.MainAxisAlignment.CENTER, spacing=5),
             bgcolor=color,
-            padding=20,
-            border_radius=50, # 圓角
-            # 使用透明黑色的 Hex 代碼 #4D000000 (約30%透明度) 取代 ft.colors.with_opacity
+            padding=15,
+            border_radius=50,
             shadow=ft.BoxShadow(spread_radius=1, blur_radius=10, color="#4D000000", offset=ft.Offset(0, 5)),
             on_click=on_click,
-            ink=True, # 點擊波紋效果
+            ink=True,
+            expand=True 
         )
 
-    # 改用字串名稱
-    btn_camera = make_big_button("camera_alt", " 影 相 片 ", "#FF9800", lambda e: call_upload())
-    
-    # 播放按鈕 (預設隱藏)
+    # 紅色與藍色按鈕
+    btn_simple = make_big_button("short_text", "簡略模式", "#2196F3", lambda e: call_upload(False))
+    btn_detailed = make_big_button("description", "照片模式", "#F44336", lambda e: call_upload(True))
+    buttons_row = ft.Row([btn_simple, ft.Container(width=10), btn_detailed], alignment=ft.MainAxisAlignment.CENTER)
+
+    # 白色播放鈕 (綠字)
     btn_play = ft.Container(
         content=ft.Row([
-            # 改用字串名稱
-            ft.Icon("play_circle_fill", size=50, color="white"),
-            ft.Text(" 再聽一次 ", size=28, weight="bold", color="white"),
+            ft.Icon("play_circle_fill", size=50, color="#4CAF50"),
+            ft.Text(" 再聽一次 ", size=28, weight="bold", color="#4CAF50"),
         ], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor="#4CAF50",
+        bgcolor="white", 
         padding=20,
         border_radius=50,
-        # 使用透明黑色的 Hex 代碼 #4D000000 取代 ft.colors.with_opacity
         shadow=ft.BoxShadow(spread_radius=1, blur_radius=10, color="#4D000000", offset=ft.Offset(0, 5)),
         on_click=lambda e: audio_player.play(),
         visible=False,
         ink=True
     )
 
-    # 底部容器
     footer = ft.Container(
         content=ft.Column([
             btn_play,
             ft.Container(height=10),
-            btn_camera
+            buttons_row 
         ]),
         padding=ft.margin.only(bottom=30)
     )
 
-    # --- 邏輯處理區 ---
-
+    # --- 邏輯 ---
     def update_status(mode):
-        """切換介面狀態 (Idle, Loading, Playing, Error)"""
-        # 使用字串名稱設定 Icon，避免 Attribute Error
         if mode == "idle":
             status_icon.name = "camera_alt_rounded"
-            status_icon.color = "#FF9800" # 橘色
+            status_icon.color = "#FF9800"
             status_icon.visible = True
             status_spinner.visible = False
-            status_label.value = "按下面按鈕\n開始拍照"
-            btn_camera.disabled = False
+            status_label.value = "請選擇模式\n開始拍照"
+            buttons_row.visible = True
             btn_play.visible = False
-            
         elif mode == "uploading":
             status_icon.visible = False
             status_spinner.visible = True
             status_label.value = "相片上傳中..."
-            btn_camera.disabled = True
-            
+            buttons_row.visible = False 
         elif mode == "thinking":
             status_icon.name = "psychology"
-            status_icon.color = "#2196F3" # 藍色
+            status_icon.color = "#2196F3"
             status_icon.visible = True
-            status_spinner.visible = True # 繼續轉
-            status_label.value = "阿嬤修等幾勒\n我咧看信..." # 台語親切感
-            
+            status_spinner.visible = True
+            status_label.value = "阿嬤修等幾勒\n我咧看信..."
         elif mode == "speaking":
             status_icon.name = "record_voice_over"
-            status_icon.color = "#4CAF50" # 綠色
+            status_icon.color = "#4CAF50"
             status_icon.visible = True
             status_spinner.visible = False
             status_label.value = "讀完囉！\n沒聽到請按綠色按鈕"
-            btn_camera.disabled = False
+            buttons_row.visible = True
             btn_play.visible = True
-            
         elif mode == "error":
             status_icon.name = "error_outline"
             status_icon.color = "red"
             status_icon.visible = True
             status_spinner.visible = False
-            # 錯誤訊息會在外面設定
-            btn_camera.disabled = False
-
+            buttons_row.visible = True
         page.update()
 
     def run_ai_task(image_bytes):
         try:
             update_status("thinking")
-            
-            # 1. 辨識
             text = ask_gemini_intent(image_bytes, current_mode["is_detailed"])
             result_text_ref.value = text
             result_card.visible = True
             page.update()
             
-            # 2. 合成
             wav_file = generate_merged_audio(text)
             
-            # 3. 準備播放
             update_status("speaking")
             audio_player.src = wav_file
             audio_player.update()
-            
-            # 嘗試自動播放 (手機可能會擋，所以我們有顯示綠色大按鈕)
             time.sleep(0.5)
             audio_player.play()
-            
         except Exception as e:
             update_status("error")
             status_label.value = "拍謝，剛才沒看清楚\n請再拍一次"
@@ -363,15 +364,14 @@ def main(page: ft.Page):
             file_path = os.path.join(page.upload_dir, e.file_name)
             try:
                 with open(file_path, "rb") as f: image_bytes = f.read()
-                # 啟動後台執行緒
                 threading.Thread(target=run_ai_task, args=(image_bytes,), daemon=True).start()
             except Exception as err:
                 update_status("error")
                 status_label.value = "讀取檔案失敗"
                 page.update()
 
-    def call_upload():
-        # 呼叫上傳前，先清空舊狀態
+    def call_upload(is_detailed):
+        current_mode["is_detailed"] = is_detailed
         result_card.visible = False
         btn_play.visible = False
         file_picker.pick_files(allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE)
@@ -383,30 +383,18 @@ def main(page: ft.Page):
             upload_url = page.get_upload_url(file_obj.name, 600)
             file_picker.upload([ft.FilePickerUploadFile(file_obj.name, upload_url)])
         else:
-            # 使用者取消，回到原狀
             update_status("idle")
 
-    # 初始化 FilePicker
     file_picker = ft.FilePicker(on_result=on_file_picked, on_upload=on_upload_result)
     page.overlay.append(file_picker)
 
-    # 組合畫面
-    page.add(
-        ft.Column([
-            header,
-            center_display,
-            footer
-        ], expand=True, alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-    )
+    page.add(ft.Column([header, center_display, footer], expand=True, alignment=ft.MainAxisAlignment.SPACE_BETWEEN))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 0))
-    # 建立目錄
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("assets", exist_ok=True)
-    # 設定密鑰
     os.environ["FLET_SECRET_KEY"] = "GrandmaSecret2025"
-    
     try:
         print("🚀 啟動中...")
         ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0", upload_dir="uploads", assets_dir="assets")
