@@ -211,24 +211,41 @@ def download_chunk_safe(params):
     return None
 
 def generate_merged_audio(text):
-    # ... (前面省略) ...
+    chunks = split_text_smartly(text)
+    temp_files_map = {}
+    created_files = []
+    
+    try:
+        # ★★★ 關鍵修正：降低平行下載數 (3 -> 2)，避免網路塞車導致 Timeout ★★★
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            tasks = [(chunk, i) for i, chunk in enumerate(chunks)]
+            futures = {executor.submit(download_chunk_safe, task): task[1] for task in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    idx, fname = future.result()
+                    temp_files_map[idx] = fname
+                    created_files.append(fname)
+                except Exception as e: raise e
+
         if len(temp_files_map) != len(chunks): raise RuntimeError("下載片段不全")
         
-        # ★★★ 修改這裡：把檔案存到 assets 資料夾底下 ★★★
-        # 使用 os.path.join 確保路徑正確
+        # ★★★ 修改這裡：把檔案存到 assets 資料夾底下 (解決手機播放問題) ★★★
         filename = f"full_audio_{int(time.time())}.wav"
-        output_filepath = os.path.join("assets", filename) 
+        # 確保路徑是 assets/filename.wav
+        output_filepath = os.path.join("assets", filename)
         
         sorted_files = [temp_files_map[i] for i in range(len(chunks))]
         
-        with wave.open(output_filepath, 'wb') as wav_out: # 寫入到 assets/xxx.wav
+        with wave.open(output_filepath, 'wb') as wav_out:
             for i, temp_file in enumerate(sorted_files):
-# ... (中間寫入邏輯不變) ...
+                with wave.open(temp_file, 'rb') as wav_in:
+                    if i == 0: wav_out.setparams(wav_in.getparams())
+                    wav_out.writeframes(wav_in.readframes(wav_in.getnframes()))
                 try: os.remove(temp_file)
                 except: pass
         
         logging.info(f"語音合併完成: {output_filepath}")
-        return filename # ★★★ 注意：回傳只要檔名就好，不用 assets/ 前綴
+        return filename # ★★★ 注意：Flet 只需要檔名，它會自動去 assets 資料夾找
     except Exception as e:
         for f in created_files:
             if os.path.exists(f): os.remove(f)
@@ -244,7 +261,9 @@ def main(page: ft.Page):
     page.bgcolor = "#FFF8F0"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.upload_dir = "uploads"
+    # 確保資料夾存在
     os.makedirs(page.upload_dir, exist_ok=True)
+    os.makedirs("assets", exist_ok=True) # 確保 assets 也存在
 
     is_seeking = False 
     current_mode = {"is_detailed": False}
@@ -276,8 +295,11 @@ def main(page: ft.Page):
         page.update()
 
     def cleanup():
+        # 清理舊的音檔，包括 assets 裡面的
         try:
-            for f in glob.glob("full_audio_*.wav") + glob.glob("temp_part_*.wav"): os.remove(f)
+            for f in glob.glob("assets/full_audio_*.wav") + glob.glob("full_audio_*.wav") + glob.glob("temp_part_*.wav"):
+                try: os.remove(f)
+                except: pass
         except: pass
 
     def run_process_in_thread(image_bytes, is_detailed):
@@ -291,11 +313,11 @@ def main(page: ft.Page):
             status_text.color = "#1976D2"
             page.update()
 
-            final_wav = generate_merged_audio(taigi_reply)
+            final_wav_filename = generate_merged_audio(taigi_reply)
             
             status_text.value = "準備播放..."
             status_text.color = "green"
-            audio_player.src = final_wav
+            audio_player.src = final_wav_filename
             audio_player.update()
             
             # 重置播放狀態
@@ -423,7 +445,11 @@ def main(page: ft.Page):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 0))
     print("Application started.")
+    
+    # 建立必要的資料夾 (uploads 和 assets)
     os.makedirs("uploads", exist_ok=True)
+    os.makedirs("assets", exist_ok=True)
+
     os.environ["FLET_SECRET_KEY"] = "GrandmaSecretKey2025"
     
     # ★★★ 智慧啟動邏輯 (保留您測試成功的設定) ★★★
@@ -434,7 +460,8 @@ if __name__ == "__main__":
             view=ft.AppView.WEB_BROWSER, 
             port=port,
             host="0.0.0.0", 
-            upload_dir="uploads"
+            upload_dir="uploads",
+            assets_dir="assets" # 確保 Flet 知道去哪裡找音檔
         )
     except Exception as e:
         print(f"⚠️ 公開模式啟動失敗: {e}")
@@ -443,5 +470,6 @@ if __name__ == "__main__":
             target=main, 
             view=ft.AppView.WEB_BROWSER, 
             port=port,
-            upload_dir="uploads"
+            upload_dir="uploads",
+            assets_dir="assets"
         )
