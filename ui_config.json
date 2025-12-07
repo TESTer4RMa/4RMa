@@ -1,0 +1,14 @@
+{
+    "app_bgcolor": "#FFF8E1",
+    "text_color_primary": "#5D4037",
+    "text_color_secondary": "#8D6E63",
+    "btn_simple_color": "#2196F3",
+    "btn_detailed_color": "#F44336",
+    "btn_camera_color": "#FF9800",
+    "btn_play_bg_color": "white",
+    "btn_play_text_color": "#4CAF50",
+    "status_icon_idle": "#FF9800",
+    "status_icon_thinking": "#2196F3",
+    "status_icon_speaking": "#4CAF50",
+    "status_icon_error": "red"
+}
