@@ -29,12 +29,17 @@ class GrandmaReaderApp:
         self.is_detailed_mode = False
         self.is_seeking = False
         self.processing_lock = threading.Lock()
+        
+        # 動態建立播放器
+        self.audio_player: Optional[ft.Audio] = None 
 
         # Init
         self.setup_page()
         self.build_ui_components()
         self.layout_ui()
         
+        # 初始掛載，但不使用 Base64，直接給空或靜音檔
+        # 這裡我們暫時不掛載任何音訊，等有檔案再掛載
         self.logger.info("應用程式初始化完成")
 
     def setup_page(self):
@@ -46,28 +51,42 @@ class GrandmaReaderApp:
         os.makedirs("uploads", exist_ok=True)
         os.makedirs("assets", exist_ok=True)
 
+    def _remount_audio_player(self, audio_url: str):
+        """
+        Robert 的核彈級重置：使用 URL 載入音訊
+        """
+        # 1. 移除舊的
+        if self.audio_player in self.page.overlay:
+            self.page.overlay.remove(self.audio_player)
+        
+        # 2. 建立新的，使用 src (URL) 而非 src_base64
+        # audio_url 應該是 "/filename.wav" 格式
+        self.audio_player = ft.Audio(
+            src=audio_url,  # <--- 關鍵修改：使用 URL
+            autoplay=False,
+            release_mode="stop",
+            on_position_changed=self.on_player_position_changed,
+            on_state_changed=self.on_player_state_changed,
+            on_loaded=lambda e: self.logger.info(f"音訊已載入: {audio_url}") # 監聽載入事件
+        )
+        
+        # 3. 加入並更新
+        self.page.overlay.append(self.audio_player)
+        self.page.update()
+        self.logger.info(f"Audio Player 重建完成，來源: {audio_url}")
+
     def build_ui_components(self):
         """初始化所有 UI 元件"""
         colors = self.config.UI_COLORS
 
-        # 1. 播放器 (Hidden)
-        self.audio_player = ft.Audio(
-            src_base64=self.config.SILENT_WAV_B64, 
-            autoplay=False, 
-            release_mode="stop",
-            on_position_changed=self.on_player_position_changed,
-            on_state_changed=self.on_player_state_changed,
-        )
-        self.page.overlay.append(self.audio_player)
-
-        # 2. 檔案選擇器 (Hidden)
+        # 1. 檔案選擇器
         self.file_picker = ft.FilePicker(
             on_result=self.on_file_picked, 
             on_upload=self.on_upload_result
         )
         self.page.overlay.append(self.file_picker)
 
-        # 3. 標題與除錯區
+        # 2. 標題與除錯區
         self.txt_result = ft.Text("", size=16, color="black", selectable=True)
         self.container_result = ft.Container(
             content=ft.Column([
@@ -89,7 +108,7 @@ class GrandmaReaderApp:
             self.btn_debug
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
 
-        # 4. 中間狀態區
+        # 3. 中間狀態區
         self.icon_status = ft.Icon(name="camera_alt_rounded", size=120, color=colors["status_icon_idle"])
         self.spinner_status = ft.ProgressRing(width=80, height=80, stroke_width=8, color="#2196F3", visible=False)
         self.lbl_status = ft.Text("請選擇模式\n開始拍照", size=24, weight="bold", 
@@ -111,7 +130,7 @@ class GrandmaReaderApp:
             expand=True
         )
 
-        # 5. 播放控制條
+        # 4. 播放控制條
         self.btn_play_pause = ft.IconButton(
             icon="play_circle_fill", icon_size=40, icon_color=colors["status_icon_speaking"],
             on_click=self.cmd_play_pause
@@ -130,7 +149,7 @@ class GrandmaReaderApp:
             visible=False, margin=ft.margin.only(bottom=15)
         )
 
-        # 6. 底部按鈕
+        # 5. 底部按鈕
         self.btn_mode_simple = self._create_mode_btn("short_text", "簡略模式", colors["btn_simple_color"], False)
         self.btn_mode_detailed = self._create_mode_btn("description", "照片模式", colors["btn_detailed_color"], True)
 
@@ -165,7 +184,6 @@ class GrandmaReaderApp:
         self.page.update()
 
     def update_ui_status(self, state: str, error_msg: Optional[str] = None):
-        """統一管理 UI 狀態變更 (View State Logic)"""
         colors = self.config.UI_COLORS
         
         if state == "idle":
@@ -189,12 +207,23 @@ class GrandmaReaderApp:
             self.icon_status.color = colors["status_icon_thinking"]
             self.lbl_status.value = "阿嬤修等幾勒\n我咧看信..."
             
+        elif state == "ready":
+            self.icon_status.visible = True
+            self.spinner_status.visible = False
+            self.icon_status.name = "volume_up_rounded"
+            self.icon_status.color = colors["status_icon_speaking"]
+            self.lbl_status.value = "讀好囉！\n請按播放鍵"
+            self.player_bar.visible = True
+            self.btn_play_pause.icon = "play_circle_fill"
+            self.slider_progress.value = 0
+            self.txt_time.value = "00:00 / 00:00"
+            
         elif state == "speaking":
             self.icon_status.visible = True
             self.spinner_status.visible = False
             self.icon_status.name = "record_voice_over"
             self.icon_status.color = colors["status_icon_speaking"]
-            self.lbl_status.value = "讀完囉！"
+            self.lbl_status.value = "正在讀給你聽..."
             self.player_bar.visible = True
             self.btn_play_pause.icon = "pause_circle_filled"
             
@@ -222,7 +251,6 @@ class GrandmaReaderApp:
                 prompt = self.config.PROMPT_DETAILED if self.is_detailed_mode else self.config.PROMPT_SIMPLE
                 text = self.gemini_service.get_intent(image_bytes, prompt)
                 
-                # 更新 UI 文字
                 self.txt_result.value = text
                 self.container_result.visible = True
                 self.btn_debug.icon = "visibility"
@@ -231,19 +259,20 @@ class GrandmaReaderApp:
                 # 2. TTS 合成
                 wav_bytes = self.tts_service.synthesize(text)
                 
-                # 3. 儲存
+                # 3. 儲存 (使用唯一檔名)
                 unique_filename = f"audio_{self.session_id}_{int(time.time())}.wav"
                 output_path = os.path.join("assets", unique_filename)
+                
                 with open(output_path, "wb") as f:
                     f.write(wav_bytes)
 
-                self.update_ui_status("speaking")
+                # 4. 核彈級重載播放器 - 改用 URL
+                # Flet 映射規則： assets/xxx.wav -> /xxx.wav
+                audio_url = f"/{unique_filename}"
+                self._remount_audio_player(audio_url)
                 
-                # 4. 播放優化 (FIXED: Clear src_base64 to allow src to work)
-                self.audio_player.autoplay = True
-                self.audio_player.src_base64 = None  # <--- 關鍵修正：清空 Base64 來源
-                self.audio_player.src = unique_filename
-                self.audio_player.update()
+                # 5. 更新 UI
+                self.update_ui_status("ready")
                 
             except Exception as e:
                 self.logger.error(f"Task Failed: {e}", exc_info=True)
@@ -259,7 +288,6 @@ class GrandmaReaderApp:
         if e.files:
             self.update_ui_status("uploading")
             f = e.files[0]
-            # Flet upload optimization
             upload_url = self.page.get_upload_url(f.name, 600)
             self.file_picker.upload([ft.FilePickerUploadFile(f.name, upload_url)])
         else:
@@ -279,12 +307,25 @@ class GrandmaReaderApp:
     # --- 播放器 UI 連動 ---
 
     def cmd_play_pause(self, e):
-        if self.btn_play_pause.icon == "pause_circle_filled":
+        is_playing = self.btn_play_pause.icon == "pause_circle_filled"
+        
+        if is_playing:
             self.audio_player.pause()
             self.btn_play_pause.icon = "play_circle_fill"
         else:
-            self.audio_player.resume()
+            # Robert: 確保 Audio 元件已經掛載
+            if not self.audio_player:
+                return
+
+            # 如果進度條在開頭，強制 play
+            if self.slider_progress.value <= 10: 
+                self.audio_player.play()
+            else:
+                self.audio_player.resume()
+                
             self.btn_play_pause.icon = "pause_circle_filled"
+            self.update_ui_status("speaking")
+            
         self.page.update()
 
     def on_seek_start(self, e):
@@ -295,11 +336,9 @@ class GrandmaReaderApp:
         self.audio_player.pause()
         pos_ms = int(self.slider_progress.value)
         self.audio_player.seek(pos_ms)
-        # 短暫延遲確保 seek 完成後再 resume 比較穩定
         self.page.run_task(self._resume_after_seek)
 
     async def _resume_after_seek(self):
-        # 這裡的非同步是一個妥協，為了讓 UI thread 有空檔處理 seek
         await asyncio.sleep(0.1) 
         self.audio_player.resume()
         self.btn_play_pause.icon = "pause_circle_filled"
@@ -308,7 +347,16 @@ class GrandmaReaderApp:
     def on_player_position_changed(self, e):
         if not self.is_seeking:
             pos = float(e.data)
-            dur = self.audio_player.get_duration()
+            
+            # Robert Fix: 為 get_duration 加上錯誤處理
+            # 當瀏覽器還在解碼 WAV 時，get_duration 可能會 Timeout
+            try:
+                dur = self.audio_player.get_duration()
+            except Exception:
+                # 若獲取失敗，先設為 0，避免 Crash，等待下一次更新
+                dur = 0
+            
+            # 只有當 duration 有效時才更新
             if dur and dur > 0:
                 self.slider_progress.max = dur
                 self.slider_progress.value = min(pos, dur)
@@ -321,19 +369,16 @@ class GrandmaReaderApp:
         if e.data == "completed":
             self.btn_play_pause.icon = "play_circle_fill"
             self.slider_progress.value = 0
-            self.audio_player.autoplay = False # 重置 autoplay
+            self.audio_player.autoplay = False 
+            self.update_ui_status("ready") 
             self.page.update()
 
 def main(page: ft.Page):
-    # 1. 初始化日誌
     config = AppConfig.load_from_env()
     setup_logging(config.LOG_FILE)
-    
-    # 2. 啟動應用
     GrandmaReaderApp(page, config)
 
 if __name__ == "__main__":
-    # 設定環境變數
     os.environ["FLET_SECRET_KEY"] = "GrandmaSecret2025"
-    
+    # Robert Note: assets_dir 設定非常重要，它將 "assets" 資料夾映射到 Web Root 的 "/"
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, upload_dir="uploads", assets_dir="assets")
