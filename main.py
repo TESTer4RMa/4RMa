@@ -3,7 +3,7 @@ import os
 import uuid
 import threading
 import time
-import asyncio  # <--- 新增 asyncio
+import asyncio
 import warnings
 from typing import Optional
 
@@ -51,14 +51,12 @@ class GrandmaReaderApp:
         colors = self.config.UI_COLORS
 
         # 1. 播放器 (Hidden)
-        # 改善：使用 autoplay=False 初始設定，稍後動態控制
         self.audio_player = ft.Audio(
             src_base64=self.config.SILENT_WAV_B64, 
             autoplay=False, 
             release_mode="stop",
             on_position_changed=self.on_player_position_changed,
             on_state_changed=self.on_player_state_changed,
-            # on_loaded=lambda e: print("Audio Loaded") # Flet 0.21.0+ feature, optional
         )
         self.page.overlay.append(self.audio_player)
 
@@ -241,9 +239,9 @@ class GrandmaReaderApp:
 
                 self.update_ui_status("speaking")
                 
-                # 4. 播放優化 (Eliminate Sleep)
-                # 設定 Autoplay = True，當 src 更新時會自動嘗試播放
+                # 4. 播放優化 (FIXED: Clear src_base64 to allow src to work)
                 self.audio_player.autoplay = True
+                self.audio_player.src_base64 = None  # <--- 關鍵修正：清空 Base64 來源
                 self.audio_player.src = unique_filename
                 self.audio_player.update()
                 
@@ -298,12 +296,11 @@ class GrandmaReaderApp:
         pos_ms = int(self.slider_progress.value)
         self.audio_player.seek(pos_ms)
         # 短暫延遲確保 seek 完成後再 resume 比較穩定
-        # Flet Audio 在頻繁操作下可能會狀態不同步
         self.page.run_task(self._resume_after_seek)
 
     async def _resume_after_seek(self):
         # 這裡的非同步是一個妥協，為了讓 UI thread 有空檔處理 seek
-        await asyncio.sleep(0.1)  # <--- 修正這裡
+        await asyncio.sleep(0.1) 
         self.audio_player.resume()
         self.btn_play_pause.icon = "pause_circle_filled"
         self.page.update()
@@ -328,7 +325,7 @@ class GrandmaReaderApp:
             self.page.update()
 
 def main(page: ft.Page):
-    # 1. 初始化日誌 (Entry Point 唯一副作用)
+    # 1. 初始化日誌
     config = AppConfig.load_from_env()
     setup_logging(config.LOG_FILE)
     
@@ -336,7 +333,7 @@ def main(page: ft.Page):
     GrandmaReaderApp(page, config)
 
 if __name__ == "__main__":
-    # 在這裡設定環境變數，或使用 .env 檔
+    # 設定環境變數
     os.environ["FLET_SECRET_KEY"] = "GrandmaSecret2025"
     
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, upload_dir="uploads", assets_dir="assets")
